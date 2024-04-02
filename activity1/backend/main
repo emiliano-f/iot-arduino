@@ -1,0 +1,1297 @@
+/*
+========================================================================================================================================================
+Proyecto Compras
+Version 2.0
+Fecha Modificación : 2017-12-04
+Responsable: Juan Cruz Poveda
+Descripción: El Script carga en el EDW los indicadores de Cantidad de OC, Días de Gestión, Plazo Prom Compra, Plazo Prom Pago y PF-Monotributistas.
+Fecha modificación : 2022-07-21
+Responsable: Sofia Lopez Ercegovich
+Descripción: Se agrega funcionalidad para traer tambien los requerimientos, ya que actualmente quedaban excluidos. Para esto se agrega otra volatil que trae
+información de los documentos 6L, 6G y 6Q. Se agrega el campo Origin_Order_Line_Num que es la linea de un requerimiento, el campo Local_Curr_Unit_Prc_Amt que es el campo
+PDPRRC de la F4311 y el campo Pending_Req_Item_Qty donde figura la cantidad pendiente a comprar, el campo es PDUOPN.
+Fecha Modificacion: 2022-09-06
+Responsable: Francis Perulero
+Descripción: Se agrega el campo Purch_Order_Detail_Txt para traer la descripción del Anexo 1 con un máximo de 2000 caracteres. Para esto se agrego la TMP_F00165 que trae el anexo en GDTXFT
+Fecha Modificaión: 2022-10-12
+Responsable: Sofia Lopez Ercegovich
+Descripción: Se agrega condición al campo PDMCU. Si la MCU incia con S, hay que ignorarla S y tomar los 4 dígitos siguientes.
+Fecha de Modificacion: 27-04-2023
+Responsable: Sofia Lopez Ercegovich
+Descripción: Se cambia la lógica para obtener el negociador, viene de la TMP_F5943205 directamente por clave (KCOO, DOCO, DCTO, LNID)
+Fecha Modificación: 28-04-2023
+Responsable: Sofia Lopez Ercegovich
+Descripción: Añadimos la lógica rubro y subrubro, si la condición material es 2 u 8 entonces tomamos los campos de la tabla F5943206,
+caso contrario de la tabla de afinidad F5943205
+========================================================================================================================================================
+*/
+DECLARE v_load_id INT64;
+--config { tags: ["PE_VPO_MV_PURCHASE_TRANSACTION", "IN:d_dw_tables.purchase_transaction","JO:p_sourcing.F4311","JO:d_dw_tables.currency_trans_rate","JO:d_dw_tables.vendor","JO:p_manual_taBpurchased_payment_condition","JO:p_sourcing.T911F0414C","JO:p_sourcing.T911F0413C","JO:d_dw_tables.account_payable","JO:p_sourcing.T001F0101","JO:p_sourcing.T001F0006","JO:p_sourcing.FLT001F4209","JO:p_sourcing.T911F00165","JO:p_sourcing.FLT911F5943205","JO:p_sourcing.T911F5943206","JO:d_dw_tables.company","JO:p_sourcing.T001F5943071","JO:d_dw_tables.calendar_date","JO:p_manual_taBholida"] }
+CALL maintenance.etl_load_control ("PE_VPO_MV_PURCHASE_TRANSACTION", v_load_id);
+
+BEGIN
+BEGIN TRANSACTION;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_param
+    CLUSTER BY start_dt, end_dt
+    AS
+      SELECT DISTINCT
+          a.start_dt,
+          b.end_dt
+        FROM
+          (
+            SELECT
+                CAST(/* expression of unknown or erroneous type */ etl_parameters.parameter_value as INT64) AS start_dt
+              FROM
+                maintenance.etl_parameters
+              WHERE upper(trim(etl_parameters.src_env_id)) = 'COM0'
+               AND upper(trim(etl_parameters.parameter_name)) = 'MESDESDE'
+          ) AS a
+          CROSS JOIN (
+            SELECT
+                CAST(/* expression of unknown or erroneous type */ etl_parameters.parameter_value as INT64) AS end_dt
+              FROM
+                maintenance.etl_parameters
+              WHERE upper(trim(etl_parameters.src_env_id)) = 'COM0'
+               AND upper(trim(etl_parameters.parameter_name)) = 'MESHASTA'
+          ) AS b
+  ;
+/*PARA CORRIDAS MANUALES*/
+/*
+UPDATE tmp_param
+				SET Start_Dt = 201801,
+			      End_Dt = 201912;
+*/
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_f4311_oc
+    AS
+      SELECT
+          pdkcoo,
+          pddoco,
+          pddcto,
+          pdsfxo,
+          pdlnid,
+          CASE
+            WHEN trim(substr(trim(pdmcu), 1, 1)) = 'S' THEN substr(trim(pdmcu), 2, length(pdmcu) - 1)
+            ELSE pdmcu
+          END AS pdmcu,
+          pdan8,
+          pddrqj,
+          pdtrdj,
+          pdtrdj_dt AS pdtrdj_dt,
+          pdpddj,
+          pdcndj,
+          pdopdj,
+          pditm,
+          pdlitm,
+          substr(trim(pdlitm), 1, 1) AS cmseg1,
+          substr(trim(pdlitm), 2, 2) AS cmseg2,
+          substr(trim(pdlitm), 4, 3) AS cmseg3,
+          pdnxtr,
+          pdlttr,
+          pduom,
+          pduorg,
+          pduopn,
+          pdprrc,
+          pdaexp,
+          pdptc,
+          pdcrcd,
+          pdfrrc,
+          pdfea,
+          pdupmj,
+          pdtday,
+          pdokco,
+          CAST(nullif(trim(pdoorn), '') as FLOAT64) AS pdoorn,
+          pdocto,
+          pdogno,
+          pdtorg,
+          pdco,
+          pdurec,
+          pdurat,
+          pdani,
+          pdaopn,
+          pdarec,
+          pdanby,
+          idori,
+          'OC' AS transaction_type
+        FROM
+          p_sourcing.f4311 AS a
+          CROSS JOIN tmp_param
+          CROSS JOIN UNNEST(ARRAY[
+            --parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(pdtrdj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))
+            d_dw_functions.jul_to_fecha(cast(trunc(pdtrdj) as INT64))
+          ]) AS pdtrdj_dt
+        WHERE trim(pddcto) IN(
+          '6A', '6D', 'OS', 'OD', '6B', '6W', '6T', '6U', 'WN', 'WI'
+        )
+         AND trim(pdkcoo) IN(
+          '00058', '00077'
+        )
+         AND --div((extract(YEAR from pdtrdj_dt) - 1900) * 10000 + extract(MONTH from pdtrdj_dt) * 100 + extract(DAY from pdtrdj_dt), 100) + 190000 BETWEEN tmp_param.start_dt AND tmp_param.end_dt
+          d_dw_functions.fecha_to_cal_month(pdtrdj_dt) BETWEEN tmp_param.start_dt AND tmp_param.end_dt
+  ;
+-- Logica para limitar periodo de carga (JC Poveda):--
+-- Se bajan de la 4311 los registros que corresponden a Requerimientos de compras
+  CREATE TEMPORARY TABLE tmp_f4311_req
+    AS
+      SELECT
+          pdkcoo,
+          pddoco,
+          pddcto,
+          pdsfxo,
+          pdlnid,
+          CASE
+            WHEN trim(substr(trim(pdmcu), 1, 1)) = 'S' THEN substr(trim(pdmcu), 2, length(pdmcu) - 1)
+            ELSE pdmcu
+          END AS pdmcu,
+          pdan8,
+          pddrqj,
+          pdtrdj,
+          pdtrdj_dt AS pdtrdj_dt,
+          pdpddj,
+          pdcndj,
+          pdopdj,
+          pditm,
+          pdlitm,
+          substr(trim(pdlitm), 1, 1) AS cmseg1,
+          substr(trim(pdlitm), 2, 2) AS cmseg2,
+          substr(trim(pdlitm), 4, 3) AS cmseg3,
+          pdnxtr,
+          pdlttr,
+          pduom,
+          pduorg,
+          pduopn,
+          pdprrc,
+          pdaexp,
+          pdptc,
+          pdcrcd,
+          pdfrrc,
+          pdfea,
+          pdupmj,
+          pdtday,
+          pdokco,
+          CAST(nullif(trim(pdoorn), '') as FLOAT64) AS pdoorn,
+          pdocto,
+          pdogno,
+          pdtorg,
+          pdco,
+          pdurec,
+          pdurat,
+          pdani,
+          pdaopn,
+          pdarec,
+          pdanby,
+          idori,
+          'RE' AS transaction_type
+        FROM
+          p_sourcing.f4311 AS a
+          CROSS JOIN tmp_param
+          CROSS JOIN UNNEST(ARRAY[
+            --parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(pdtrdj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))
+          d_dw_functions.jul_to_fecha(cast(trunc(pdtrdj) as INT64))
+          ]) AS pdtrdj_dt
+        WHERE trim(pddcto) IN(
+          '6L', '6G', '6Q'
+        )
+         AND trim(pdkcoo) IN(
+          '00058', '00077'
+        )
+         AND upper(trim(a.idori)) = 'FL'
+         AND pdoorn <> '000000UN'
+         AND pdoorn <> '000000KG'
+         AND --div((extract(YEAR from pdtrdj_dt) - 1900) * 10000 + extract(MONTH from pdtrdj_dt) * 100 + extract(DAY from pdtrdj_dt), 100) + 190000 BETWEEN tmp_param.start_dt AND tmp_param.end_dt
+         d_dw_functions.fecha_to_cal_month(pdtrdj_dt) BETWEEN tmp_param.start_dt AND tmp_param.end_dt
+  ;
+--  Agregado por Eve 16-07-2019 para evitar que falle
+--  Agregado por Azul 13-03-2021 para evitar que falle
+-- Se juntan tanto los registros de la 4311 que correspondian a Ordenes de Compra (Proceso original) como los de Requerimientos (Originalmente excluidos en el proceso)
+  CREATE TEMPORARY TABLE tmp_f4311
+    AS
+      SELECT
+          tmp_f4311_oc.pdkcoo,
+          tmp_f4311_oc.pddoco,
+          tmp_f4311_oc.pddcto,
+          tmp_f4311_oc.pdsfxo,
+          tmp_f4311_oc.pdlnid,
+          tmp_f4311_oc.pdmcu,
+          tmp_f4311_oc.pdan8,
+          tmp_f4311_oc.pddrqj,
+          tmp_f4311_oc.pdtrdj,
+          tmp_f4311_oc.pdtrdj_dt,
+          tmp_f4311_oc.pdpddj,
+          tmp_f4311_oc.pdcndj,
+          tmp_f4311_oc.pdopdj,
+          tmp_f4311_oc.pditm,
+          tmp_f4311_oc.pdlitm,
+          tmp_f4311_oc.cmseg1,
+          tmp_f4311_oc.cmseg2,
+          tmp_f4311_oc.cmseg3,
+          tmp_f4311_oc.pdnxtr,
+          tmp_f4311_oc.pdlttr,
+          tmp_f4311_oc.pduom,
+          tmp_f4311_oc.pduorg,
+          tmp_f4311_oc.pduopn,
+          tmp_f4311_oc.pdprrc,
+          tmp_f4311_oc.pdaexp,
+          tmp_f4311_oc.pdptc,
+          tmp_f4311_oc.pdcrcd,
+          tmp_f4311_oc.pdfrrc,
+          tmp_f4311_oc.pdfea,
+          tmp_f4311_oc.pdupmj,
+          tmp_f4311_oc.pdtday,
+          tmp_f4311_oc.pdokco,
+          tmp_f4311_oc.pdoorn,
+          tmp_f4311_oc.pdocto,
+          tmp_f4311_oc.pdogno,
+          tmp_f4311_oc.pdtorg,
+          tmp_f4311_oc.pdco,
+          tmp_f4311_oc.pdurec,
+          tmp_f4311_oc.pdurat,
+          tmp_f4311_oc.pdani,
+          tmp_f4311_oc.pdaopn,
+          tmp_f4311_oc.pdarec,
+          tmp_f4311_oc.pdanby,
+          tmp_f4311_oc.idori,
+          tmp_f4311_oc.transaction_type
+        FROM
+          tmp_f4311_oc
+      UNION ALL
+      SELECT
+          tmp_f4311_req.pdkcoo,
+          tmp_f4311_req.pddoco,
+          tmp_f4311_req.pddcto,
+          tmp_f4311_req.pdsfxo,
+          tmp_f4311_req.pdlnid,
+          tmp_f4311_req.pdmcu,
+          tmp_f4311_req.pdan8,
+          tmp_f4311_req.pddrqj,
+          tmp_f4311_req.pdtrdj,
+          tmp_f4311_req.pdtrdj_dt,
+          tmp_f4311_req.pdpddj,
+          tmp_f4311_req.pdcndj,
+          tmp_f4311_req.pdopdj,
+          tmp_f4311_req.pditm,
+          tmp_f4311_req.pdlitm,
+          tmp_f4311_req.cmseg1,
+          tmp_f4311_req.cmseg2,
+          tmp_f4311_req.cmseg3,
+          tmp_f4311_req.pdnxtr,
+          tmp_f4311_req.pdlttr,
+          tmp_f4311_req.pduom,
+          tmp_f4311_req.pduorg,
+          tmp_f4311_req.pduopn,
+          tmp_f4311_req.pdprrc,
+          tmp_f4311_req.pdaexp,
+          tmp_f4311_req.pdptc,
+          tmp_f4311_req.pdcrcd,
+          tmp_f4311_req.pdfrrc,
+          tmp_f4311_req.pdfea,
+          tmp_f4311_req.pdupmj,
+          tmp_f4311_req.pdtday,
+          -- Si aun el requerimiento no tiene orden de compra aprobada los campos compañia, doc, tipo de doc y linea vienen en los lugares donde luego va a ir la informacion de Orden de Compra (PDDOCO, PDDCTO, etc). Cuando se genera la OC se mueven a PDOKCO, PDOORN, PDOCTO y PDOGNO que es su lugar final.
+          CASE
+            WHEN upper(trim(tmp_f4311_req.pdokco)) = '' THEN tmp_f4311_req.pdkcoo
+            ELSE tmp_f4311_req.pdokco
+          END AS pdokco,
+          CASE
+            WHEN tmp_f4311_req.pdoorn = 0.0 THEN tmp_f4311_req.pddoco
+            ELSE tmp_f4311_req.pdoorn
+          END AS pdoorn,
+          CASE
+            WHEN upper(trim(tmp_f4311_req.pdocto)) = '' THEN tmp_f4311_req.pddcto
+            ELSE tmp_f4311_req.pdocto
+          END AS pdocto,
+          CASE
+            WHEN upper(trim(cast(tmp_f4311_req.pdogno as STRING))) = ''
+             OR tmp_f4311_req.pdogno = 0 THEN tmp_f4311_req.pdlnid
+            ELSE tmp_f4311_req.pdogno
+          END AS pdogno,
+          -- --------------------------------------------------------------------------------------
+          tmp_f4311_req.pdtorg,
+          tmp_f4311_req.pdco,
+          tmp_f4311_req.pdurec,
+          tmp_f4311_req.pdurat,
+          tmp_f4311_req.pdani,
+          tmp_f4311_req.pdaopn,
+          tmp_f4311_req.pdarec,
+          tmp_f4311_req.pdanby,
+          tmp_f4311_req.idori,
+          tmp_f4311_req.transaction_type
+        FROM
+          tmp_f4311_req
+  ;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_pes_to_usd
+    AS
+      SELECT DISTINCT
+          currency_trans_rate.curr_trans_start_dt AS date_from,
+          cast(1 / currency_trans_rate.curr_rate_rate as NUMERIC) AS factor_conversion
+        FROM
+          d_dw_tables.currency_trans_rate
+        WHERE trim(currency_trans_rate.transl_from_curr_cd) <> ''
+         AND trim(currency_trans_rate.base_curr_cd) IN(
+          'PEN'
+        )
+         AND trim(currency_trans_rate.transl_from_curr_cd) IN(
+          'USD'
+        )
+         AND upper(trim(currency_trans_rate.src_env_id)) = 'EO'
+  ;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_plazo_proveedor
+    AS
+      SELECT DISTINCT
+          a.src_env_id,
+          a.vendor_party_id AS vendor_party_id,
+          a.pmt_term_cd AS pmt_term_cd,
+          b.condition_term_project_cd AS pmt_num
+        FROM
+          d_dw_tables.vendor AS a
+          CROSS JOIN p_manual_tables.purchased_payment_condition AS b
+        WHERE trim(a.pmt_term_cd) = trim(b.condition_term_cd)
+  ;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+-- Creo tabla de Ordenes de Pago.
+  CREATE TEMPORARY TABLE tmp_payord
+    AS
+      SELECT
+          t911f0414c.rnkco,
+          t911f0414c.rndct,
+          t911f0414c.rndoc,
+          t911f0414c.rnsfx,
+          t911f0414c.rnpyid,
+          t911f0414c.rndctm
+        FROM
+          p_sourcing.t911f0414c
+        WHERE trim(t911f0414c.rnkco) IN(
+          '00058', '00077'
+        )
+         AND upper(t911f0414c.rndctm) NOT LIKE 'PG'
+         AND t911f0414c.rnpyid NOT IN(
+          SELECT
+              t911f0414c.rnpyid
+            FROM
+              p_sourcing.t911f0414c AS t911f0414c_0
+            WHERE trim(t911f0414c.rnkco) IN(
+              '00058', '00077'
+            )
+             AND upper(trim(t911f0414c.rndctm)) = 'PO'
+        )
+  ;
+  DELETE FROM tmp_payord WHERE (tmp_payord.rnkco, tmp_payord.rndct, tmp_payord.rndoc, tmp_payord.rnsfx) IN(
+    SELECT AS STRUCT
+        a.rnkco,
+        a.rndct,
+        a.rndoc,
+        a.rnsfx
+      FROM
+        tmp_payord AS a
+        CROSS JOIN tmp_payord AS b
+      WHERE a.rnkco = b.rnkco
+       AND a.rndct = b.rndct
+       AND a.rndoc = b.rndoc
+       AND a.rnsfx = b.rnsfx
+       AND a.rnpyid > b.rnpyid
+  );
+  CREATE TEMPORARY TABLE tmp_payord_2
+    AS
+      SELECT
+          a.rnkco,
+          a.rndct,
+          a.rndoc,
+          a.rnsfx,
+          a.rnpyid,
+          b.rmvldt
+        FROM
+          tmp_payord AS a
+          LEFT OUTER JOIN p_sourcing.t911f0413c AS b ON a.rnpyid = b.rmpyid
+           AND upper(trim(idori)) = 'FL'
+        WHERE upper(trim(a.rndctm)) <> 'PN'
+         AND upper(trim(a.rndctm)) <> 'PN'
+  ;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_payments
+    CLUSTER BY src_env_id
+    AS
+      SELECT DISTINCT
+          'PE' AS src_env_id,
+          a.company_cd,
+          a.related_vendor_po_type_cd AS order_type_cd,
+          a.related_vendor_po_id AS order_doc_num,
+          a.related_vendor_po_line_num AS order_line_num,
+          CASE
+            WHEN trim(c.mcrp01) = ''
+             OR trim(c.mcrp01) IS NULL THEN '-1'
+            ELSE trim(c.mcrp01)
+          END AS inv_cost_center_business_cd,
+          coalesce(trim(d.mcmcu), '-1') AS inv_cost_center_plant_cd,
+          a.oper_cost_center_cd AS inv_cost_center_cd,
+          a.vendor_party_id,
+          a.ap_txn_type_cd,
+          vendor_issuing_center_cd AS vendor_issuing_center_cd,
+          -- Factura del proveedor
+          vendor_invoice_cd AS vendor_invoice_cd,
+          --  PF y MONO
+          a.ap_txn_line_num AS vendor_invoice_line_cd,
+          substr(a.tax_area_cd, 1, 4) AS vendor_desc,
+          e.abtax AS vendor_tax_identifier_id,
+          e.abat1 AS vendor_party_type,
+          h.pmt_num AS vendor_pmt_term_num,
+          CASE
+            WHEN trim(substr(tax_area_cd, 1, 4)) = 'MONO' THEN 'Monotributistas'
+            ELSE CASE
+              WHEN trim(substr(trim(e.abtax), 1, 1)) = '2' THEN 'Persona Fisica'
+              ELSE 'Null'
+            END
+          END AS fiscal_condition_id,
+          invoice_dt AS vendor_invoice_dt,
+          vendor_invoice_month AS vendor_invoice_month,
+          order_dt AS order_dt,
+          order_month AS order_month,
+          local_curr_gross_amt AS invoice_amt,
+          --  PF Y MONO, Plazo Pago
+          date_diff(order_dt, invoice_dt, DAY) AS order_payment_term
+        FROM
+          --  PLAZO PAGO
+          d_dw_tables.account_payable AS a
+          LEFT OUTER JOIN tmp_payord_2 AS b ON a.company_cd = b.rnkco
+           AND a.ap_txn_type_cd = b.rndct
+           AND a.ap_txn_id = b.rndoc
+           AND a.ap_txn_line_num = b.rnsfx
+          LEFT OUTER JOIN (
+            SELECT DISTINCT
+                t001f0101.aban8,
+                t001f0101.abtax,
+                t001f0101.abat1
+              FROM
+                p_sourcing.t001f0101
+          ) AS e ON a.vendor_party_id = e.aban8
+          LEFT OUTER JOIN tmp_plazo_proveedor AS h ON CAST(/* expression of unknown or erroneous type */ h.vendor_party_id as INT64) = a.vendor_party_id
+           AND a.src_env_id = h.src_env_id
+          LEFT OUTER JOIN p_sourcing.t001f0006 AS c ON trim(a.oper_cost_center_cd) = trim(c.mcmcu)
+          LEFT OUTER JOIN p_sourcing.t001f0006 AS d ON trim(substr(coalesce(trim(a.oper_cost_center_cd), '-1'), 1, 4)) = trim(d.mcmcu)
+          CROSS JOIN tmp_param
+          CROSS JOIN UNNEST(ARRAY[
+            CASE
+              WHEN b.rmvldt IS NULL THEN CAST(NULL as INT64)
+              ELSE --div((extract(YEAR from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(b.rmvldt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) - 1900) * 10000 + extract(MONTH from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(b.rmvldt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) * 100 + extract(DAY from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(b.rmvldt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))), 100) + 190000
+              d_dw_functions.jul_to_cal_month(cast(trunc(b.rmvldt) as INT64))
+            END
+          ]) AS order_month
+          CROSS JOIN UNNEST(ARRAY[
+            --invoice_dt / 100 + 190000
+            d_dw_functions.fecha_to_cal_month(invoice_dt)
+          ]) AS vendor_invoice_month
+          CROSS JOIN UNNEST(ARRAY[
+            CASE
+              WHEN strpos(a.legal_doc_num, '-') > 0 THEN concat(substr(a.legal_doc_num, 1, strpos(a.legal_doc_num, '-') - 1), substr(a.legal_doc_num, strpos(a.legal_doc_num, '-') + 1, 20))
+              ELSE a.legal_doc_num
+            END
+          ]) AS vendor_invoice_cd
+          CROSS JOIN UNNEST(ARRAY[
+            substr(a.legal_doc_num, 1, 4)
+          ]) AS vendor_issuing_center_cd
+          CROSS JOIN UNNEST(ARRAY[
+            CASE
+              WHEN b.rmvldt IS NULL THEN CAST(NULL as DATE)
+              ELSE --parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(b.rmvldt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))
+                d_dw_functions.jul_to_fecha(cast(trunc(b.rmvldt) as INT64))
+            END
+          ]) AS order_dt
+        WHERE upper(trim(a.ap_txn_type_cd)) NOT IN(
+          'PK', 'PN', 'P1', 'PH', 'LV', 'FF', 'PV', 'PP', 'BG', 'BK'
+        )
+         AND upper(a.ap_txn_type_cd) NOT LIKE '$%'
+         AND trim(a.company_cd) IN(
+          '00058', '00077'
+        )
+         AND upper(trim(vendor_issuing_center_cd)) NOT IN(
+          'SEG'
+        )
+         AND order_dt IS NOT NULL
+         AND trim(substr(vendor_issuing_center_cd, 1, 1)) <> 'S'
+         AND (vendor_invoice_cd NOT LIKE '%a%'
+         AND vendor_invoice_cd NOT LIKE '%b%'
+         AND vendor_invoice_cd NOT LIKE '%c%'
+         AND vendor_invoice_cd NOT LIKE '%d%'
+         AND vendor_invoice_cd NOT LIKE '%e%'
+         AND vendor_invoice_cd NOT LIKE '%f%'
+         AND vendor_invoice_cd NOT LIKE '%g%'
+         AND vendor_invoice_cd NOT LIKE '%h%'
+         AND vendor_invoice_cd NOT LIKE '%i%'
+         AND vendor_invoice_cd NOT LIKE '%j%'
+         AND vendor_invoice_cd NOT LIKE '%k%'
+         AND vendor_invoice_cd NOT LIKE '%l%'
+         AND vendor_invoice_cd NOT LIKE '%m%'
+         AND vendor_invoice_cd NOT LIKE '%n%'
+         AND vendor_invoice_cd NOT LIKE '%o%'
+         AND vendor_invoice_cd NOT LIKE '%p%'
+         AND vendor_invoice_cd NOT LIKE '%q%'
+         AND vendor_invoice_cd NOT LIKE '%r%'
+         AND vendor_invoice_cd NOT LIKE '%s%'
+         AND vendor_invoice_cd NOT LIKE '%t%'
+         AND vendor_invoice_cd NOT LIKE '%u%'
+         AND vendor_invoice_cd NOT LIKE '%v%'
+         AND vendor_invoice_cd NOT LIKE '%w%'
+         AND vendor_invoice_cd NOT LIKE '%x%'
+         AND vendor_invoice_cd NOT LIKE '%y%'
+         AND vendor_invoice_cd NOT LIKE '%z%'
+         AND vendor_invoice_cd NOT LIKE '%-%'
+         AND vendor_invoice_cd NOT LIKE '%/%')
+         AND (a.related_vendor_po_id IS NOT NULL
+         AND order_month BETWEEN tmp_param.start_dt AND tmp_param.end_dt)
+         OR a.related_vendor_po_id IS NULL
+         AND vendor_invoice_month BETWEEN tmp_param.start_dt AND tmp_param.end_dt
+  ;
+-- Logica para limitar periodo de carga (JC Poveda):--
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_aprobaciones_cotizaciones
+    CLUSTER BY order_doc_num
+    AS
+      SELECT DISTINCT
+          -- Este select corresponde a Script Original donde se realiza lo que es Ordenes de Compra (No se modificò nada, solo el campo Approval_Dt, el casteo)
+          a.pdkcoo AS company_cd,
+          a.pddcto AS order_type_cd,
+          CAST(/* expression of unknown or erroneous type */ a.pddoco as INT64) AS order_doc_num,
+          a.pdlnid AS order_line_num,
+          a.pdocto AS origin_order_type_cd,
+          CAST(a.pdoorn as INT64) AS orig_requirement_cd,
+          a.pdokco AS origin_company_cd,
+          a.pdogno AS origin_line_num,
+          f.hordj AS approval_dt
+        FROM
+          tmp_f4311 AS a
+          LEFT OUTER JOIN (
+            SELECT DISTINCT
+                f4311.pddoco,
+                f4311.pdokco,
+                f4311.pdkcoo,
+                f4311.pdlnid,
+                f4311.pddcto,
+                f4311.pdocto,
+                f4311.pdoorn
+              FROM
+                p_sourcing.f4311
+          ) AS b ON a.pdoorn = b.pddoco
+           AND a.pdokco = b.pdkcoo
+           AND a.pdogno = b.pdlnid
+           AND a.pdocto = b.pddcto
+          LEFT OUTER JOIN (
+            SELECT DISTINCT
+                flt001f4209.hokcoo,
+                flt001f4209.hodcto,
+                flt001f4209.hodoco,
+                max(flt001f4209.hordj) AS hordj
+              FROM
+                p_sourcing.flt001f4209
+              WHERE upper(trim(flt001f4209.hoasts)) = '2A'
+               AND trim(flt001f4209.hodcto) IN(
+                '6G', '6L', '6Q', '6S', '6K'
+              )
+              GROUP BY 1, 2, 3
+          ) AS f ON b.pdokco = f.hokcoo
+           AND b.pdocto = f.hodcto
+           AND b.pdoorn = cast(f.hodoco as STRING)
+        WHERE upper(trim(a.transaction_type)) = 'OC'
+         AND upper(trim(a.pdocto)) = '6K'
+         AND upper(trim(a.idori)) = 'FL'
+         AND trim(a.pdkcoo) IN(
+          '00058', '00077'
+        )
+      UNION ALL
+      SELECT DISTINCT
+          -- Se agrega para que traiga informaciòn sobre Requerimientos. SI TOCAR lo que es Ordenes de Compra. Usa logica distinta.
+          a.pdkcoo AS company_cd,
+          a.pddcto AS order_type_cd,
+          CAST(/* expression of unknown or erroneous type */ a.pddoco as INT64) AS order_doc_num,
+          a.pdlnid AS order_line_num,
+          a.pdocto AS origin_order_type_cd,
+          CAST(a.pdoorn as INT64) AS orig_requirement_cd,
+          a.pdokco AS origin_company_cd,
+          a.pdogno AS origin_line_num,
+          f.hordj AS approval_dt
+        FROM
+          tmp_f4311 AS a
+          LEFT OUTER JOIN (
+            SELECT DISTINCT
+                flt001f4209.hokcoo,
+                flt001f4209.hodcto,
+                flt001f4209.hodoco,
+                max(flt001f4209.hordj) AS hordj
+              FROM
+                p_sourcing.flt001f4209
+              WHERE upper(trim(flt001f4209.hoasts)) = '2A'
+               AND trim(flt001f4209.hodcto) IN(
+                '6G', '6L', '6Q', '6S', '6K'
+              )
+              GROUP BY 1, 2, 3
+          ) AS f ON a.pdkcoo = f.hokcoo
+           AND a.pddcto = f.hodcto
+           AND a.pddoco = f.hodoco
+        WHERE upper(trim(a.transaction_type)) = 'RE'
+         AND upper(trim(a.idori)) = 'FL'
+         AND trim(a.pdkcoo) IN(
+          '00058', '00077'
+        )
+  ;
+  CREATE TEMPORARY TABLE tmp_aprob_cotizaciones_1
+    CLUSTER BY orig_requirement_cd
+    AS
+      SELECT
+          tmp_aprobaciones_cotizaciones.company_cd,
+          tmp_aprobaciones_cotizaciones.orig_requirement_cd,
+          tmp_aprobaciones_cotizaciones.origin_order_type_cd,
+          tmp_aprobaciones_cotizaciones.origin_line_num,
+          min(tmp_aprobaciones_cotizaciones.approval_dt) AS approval_dt
+        FROM
+          tmp_aprobaciones_cotizaciones
+        GROUP BY 1, 2, 3, 4
+  ;
+  CREATE TEMPORARY TABLE tmp_aprob_cotizaciones_f
+    CLUSTER BY orig_requirement_cd
+    AS
+      SELECT
+          tmp_aprob_cotizaciones_1.company_cd,
+          tmp_aprob_cotizaciones_1.orig_requirement_cd,
+          tmp_aprob_cotizaciones_1.origin_order_type_cd,
+          tmp_aprob_cotizaciones_1.origin_line_num,
+          --parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(tmp_aprob_cotizaciones_1.approval_dt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8)) AS approval_dt,
+          d_dw_functions.jul_to_fecha(cast(trunc(tmp_aprob_cotizaciones_1.approval_dt) as INT64)) AS approval_dt,
+          --div((extract(YEAR from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(tmp_aprob_cotizaciones_1.approval_dt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) - 1900) * 10000 + extract(MONTH from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(tmp_aprob_cotizaciones_1.approval_dt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) * 100 + extract(DAY from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(tmp_aprob_cotizaciones_1.approval_dt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))), 100) + 190000 AS approval_month
+          d_dw_functions.jul_to_cal_month(cast(trunc(tmp_aprob_cotizaciones_1.approval_dt) as INT64)) AS approval_month
+        FROM
+          tmp_aprob_cotizaciones_1
+  ;
+-- ***********************************************************************************************************************************************************--
+--  Se agrega creacion de tabla volatil TMP_F4209_1 y TMP_F4209_2. Esta ultima sera utilizada en la volatil TMP_PURCHASES para poder obtener la diferencia
+--  de dias entre la fecha de aprobacion y la fecha de OC. Previamente en el script original esto fallaba ya que no taria la diferencia de dias de forma
+--  correcta.
+-- ********************************************************************************************************************************************************** --
+  CREATE TEMPORARY TABLE tmp_f4209_1
+    AS
+      SELECT DISTINCT
+          flt001f4209.hokcoo,
+          flt001f4209.hodcto,
+          flt001f4209.hodoco,
+          max(flt001f4209.hordj) AS hordj
+        FROM
+          p_sourcing.flt001f4209
+        WHERE upper(trim(flt001f4209.hoasts)) = '2A'
+         AND trim(flt001f4209.hodcto) IN(
+          '6G', '6L', '6Q', '6S'
+        )
+        GROUP BY 1, 2, 3
+  ;
+  CREATE TEMPORARY TABLE tmp_f4209_2
+    AS
+      SELECT DISTINCT
+          tmp_f4209_1.hokcoo,
+          tmp_f4209_1.hodcto,
+          tmp_f4209_1.hodoco,
+          --parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(tmp_f4209_1.hordj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8)) AS hordj,
+          d_dw_functions.jul_to_fecha(cast(trunc(tmp_f4209_1.hordj) as INT64)) AS hordj,
+          --div((extract(YEAR from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(tmp_f4209_1.hordj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) - 1900) * 10000 + extract(MONTH from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(tmp_f4209_1.hordj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) * 100 + extract(DAY from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(tmp_f4209_1.hordj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))), 100) + 190000 AS hordj_month
+          d_dw_functions.jul_to_cal_month(cast(trunc(tmp_f4209_1.hordj) as INT64)) AS hordj_month
+        FROM
+          tmp_f4209_1
+  ;
+-- **************************************************************************************************************************************************
+-- **************************************************************************************************************************************************
+  CREATE TEMPORARY TABLE tmp_f00165
+    AS
+      SELECT
+          t2.gdkcoo,
+          t2.gddcto,
+          t2.gddoco,
+          t2.gdlnid,
+          substr(trim(concat(t2.txt1, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt2, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt3, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt4, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt5, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt6, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt7, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt8, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt9, code_points_to_string(ARRAY[
+            13
+          ]), t2.txt10)), 1, 2000) AS gdtxft
+        FROM
+          (
+            SELECT
+                t1.gdkcoo,
+                t1.gddcto,
+                t1.gddoco,
+                t1.gdlnid,
+                max(t1.text1) AS txt1,
+                max(t1.text2) AS txt2,
+                max(t1.text3) AS txt3,
+                max(t1.text4) AS txt4,
+                max(t1.text5) AS txt5,
+                max(t1.text6) AS txt6,
+                max(t1.text7) AS txt7,
+                max(t1.text8) AS txt8,
+                max(t1.text9) AS txt9,
+                max(t1.text10) AS txt10
+              FROM
+                (
+                  SELECT
+                      t911f00165.gdkcoo,
+                      t911f00165.gddcto,
+                      t911f00165.gddoco,
+                      t911f00165.gdlnid,
+                      t911f00165.gdmoseqn,
+                      rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) AS orden,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 1 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text1,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 2 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text2,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 3 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text3,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 4 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text4,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 5 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text5,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 6 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text6,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 7 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text7,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 8 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text8,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 9 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text9,
+                      CASE
+                        WHEN rank() OVER (PARTITION BY t911f00165.gdkcoo, t911f00165.gddcto, t911f00165.gddoco, t911f00165.gdlnid ORDER BY t911f00165.gdmoseqn) = 10 THEN concat(trim(substr(t911f00165.gdtxft, 1, 2000)), ' ')
+                        ELSE ''
+                      END AS text10
+                    FROM
+                      p_sourcing.t911f00165
+                ) AS t1
+              GROUP BY 1, 2, 3, 4
+          ) AS t2
+  ;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_f5943205
+    AS
+      SELECT
+          flt911f5943205.gakcoo,
+          flt911f5943205.gadoco,
+          flt911f5943205.gadcto,
+          flt911f5943205.galnid,
+          flt911f5943205.ga59pais,
+          flt911f5943205.galitm,
+          flt911f5943205.gaseg1,
+          flt911f5943205.gaseg2,
+          flt911f5943205.gaseg3,
+          flt911f5943205.ga59rub,
+          flt911f5943205.gaab59sub,
+          flt911f5943205.gaan82,
+          flt911f5943205.ga59codge,
+          flt911f5943205.gaan8,
+          flt911f5943205.gaan81,
+          flt911f5943205.gaev01,
+          flt911f5943205.gadl01,
+          flt911f5943205.gaurrf,
+          flt911f5943205.gaurab,
+          flt911f5943205.gaurdt,
+          flt911f5943205.gaurat,
+          flt911f5943205.gaurcd,
+          flt911f5943205.gauser,
+          flt911f5943205.gapid,
+          flt911f5943205.gajobn,
+          flt911f5943205.gaupmj,
+          flt911f5943205.gaupmt
+        FROM
+          p_sourcing.flt911f5943205
+        WHERE trim(flt911f5943205.gakcoo) IN(
+          '00058', '00077'
+        )
+  ;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_purchases
+    CLUSTER BY order_doc_num
+    AS
+      SELECT
+          cia.country_cd AS src_env_id,
+          a.pdkcoo AS company_cd,
+          a.pddcto AS order_type_cd,
+          a.pdsfxo AS order_suffix,
+          CAST(/* expression of unknown or erroneous type */ a.pddoco as INT64) AS order_doc_num,
+          a.pdlnid AS order_line_num,
+          CASE
+            WHEN trim(l.mcrp01) = ''
+             OR trim(l.mcrp01) IS NULL THEN '-1'
+            ELSE trim(l.mcrp01)
+          END AS oper_cost_center_business_cd,
+          coalesce(trim(m.mcmcu), '-1') AS oper_cost_center_plant_cd,
+          coalesce(a.pdmcu, '-1') AS oper_cost_center_cd,
+          a.pduom AS uom_cd,
+          a.pdnxtr AS order_next_status,
+          a.pdlttr AS order_last_status,
+          CASE
+            WHEN a.pdoorn IS NULL THEN -1
+            WHEN CAST(a.pdoorn as INT64) = 0 THEN -1
+            ELSE CAST(a.pdoorn as INT64)
+          END AS orig_requirement_cd,
+          -- Nro de Requerimiento
+          CASE
+            WHEN a.pdocto IS NULL THEN '-1'
+            WHEN trim(a.pdocto) = '' THEN '-1'
+            WHEN trim(a.pdocto) = '0' THEN '-1'
+            ELSE a.pdocto
+          END AS origin_order_type_cd,
+          -- Tipo de Requerimiento
+          CASE
+            WHEN a.pdogno IS NULL THEN -1
+            WHEN a.pdogno = 0 THEN -1
+            ELSE a.pdogno
+          END AS origin_order_line_num,
+          -- Linea de Requerimiento
+          CASE
+            WHEN upper(trim(a.pdocto)) = '6K'
+             AND w.approval_dt IS NOT NULL THEN --parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(w.approval_dt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))
+              d_dw_functions.jul_to_fecha(cast(trunc(w.approval_dt) as INT64))
+            ELSE CASE
+              WHEN h.hordj IS NULL THEN CAST(NULL as DATE)
+              ELSE --parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(h.hordj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))
+                d_dw_functions.jul_to_fecha(cast(trunc(h.hordj) as INT64))
+            END
+          END AS approval_dt,
+          CASE
+            WHEN upper(trim(a.pdocto)) = '6K' THEN --div((extract(YEAR from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(w.approval_dt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) - 1900) * 10000 + extract(MONTH from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(w.approval_dt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) * 100 + extract(DAY from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(w.approval_dt, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))), 100) + 190000
+              d_dw_functions.jul_to_cal_month(cast(trunc(w.approval_dt) as INT64))
+            ELSE --div((extract(YEAR from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(h.hordj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) - 1900) * 10000 + extract(MONTH from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(h.hordj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) * 100 + extract(DAY from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(h.hordj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))), 100) + 190000
+              d_dw_functions.jul_to_cal_month(cast(trunc(h.hordj) as INT64))
+          END AS approval_month,
+          a.pdtrdj_dt AS order_dt,
+          --div((extract(YEAR from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(a.pdtrdj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) - 1900) * 10000 + extract(MONTH from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(a.pdtrdj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))) * 100 + extract(DAY from parse_date('%Y%j', substr(concat(CAST(1900000 + CAST(coalesce(nullif(a.pdtrdj, NUMERIC '0'), CAST(1 as BIGNUMERIC)) as INT64) as STRING), '        '), 1, 8))), 100) + 190000 AS order_month,
+          d_dw_functions.jul_to_cal_month(a.pdtrdj) AS order_month,
+          CASE
+            WHEN k.abtrdj IS NOT NULL THEN 1
+            ELSE 0
+          END AS corporate_item_id,
+          CASE
+            WHEN a.pdtrdj BETWEEN k.abtrdj AND k.abaddj THEN 1
+            ELSE 0
+          END AS item_term_cd,
+          a.pdptc AS order_pmt_term_cd,
+          f.condition_term_project_cd AS order_term_num,
+          a.pdtorg AS order_originator_id,
+          CASE
+            WHEN trim(substr(a.pdlitm, 1, 1)) IN(
+              '2', '8'
+            ) THEN coalesce(trim(r.rp59rub), '-1')
+            ELSE coalesce(trim(n.ga59rub), '-1')
+          END AS category_cd,
+          -- Rubro
+          CASE
+            WHEN trim(substr(a.pdlitm, 1, 1)) IN(
+              '2', '8'
+            ) THEN coalesce(trim(r.rpab59sub), '-1')
+            ELSE coalesce(trim(n.gaab59sub), '-1')
+          END AS subcategory_cd,
+          -- Subrubro
+          CASE
+            WHEN n.gaan82 IN(
+              CAST(0 as BIGNUMERIC), NUMERIC '0.00'
+            ) THEN -1
+            ELSE coalesce(n.gaan82, -1)
+          END AS order_negotiator_id,
+          CASE
+            WHEN trim(n.ga59codge) = '' THEN 'Valor No Informado'
+            ELSE coalesce(n.ga59codge, 'Valor No Informado')
+          END AS management_id,
+          DATE '1900-01-01' AS term_dt,
+          a.pdanby AS req_negotiator_id,
+          a.pdcrcd AS order_currency_cd,
+          CAST(/* expression of unknown or erroneous type */ a.pdan8 as INT64) AS vendor_party_id,
+          g.pmt_num AS vendor_pmt_term_num,
+          a.pdlitm AS purch_item_cd,
+          replace(coalesce(b.gdtxft, ' '), coalesce(code_points_to_string(ARRAY[
+            10
+          ]), ''), ' ') AS purch_order_detail_txt,
+          -- - ANEXO 1
+          date_add(date_sub(a.pdtrdj_dt, interval CAST(trunc(w.approval_dt) as INT64) DAY), interval 1 DAY) AS days_delay,
+          CAST(a.pdarec as NUMERIC) AS decimal_received_amt,
+          ROUND(CAST(a.pdarec as NUMERIC) / NUMERIC '100.0000', 4, 'ROUND_HALF_EVEN') AS received_amt,
+          CAST(a.pdurec as NUMERIC) AS decimal_purchased_qty,
+          ROUND(CAST(a.pdurec as NUMERIC) / NUMERIC '1000000.000000', 6, 'ROUND_HALF_EVEN') AS purchased_qty,
+          ROUND(cast(a.pduorg / NUMERIC '1000000.000000' as NUMERIC), 6, 'ROUND_HALF_EVEN') AS purch_req_item_qty,
+          --  Cantidad Original
+          ROUND(cast(a.pduopn / NUMERIC '1000000.000000' as NUMERIC), 6, 'ROUND_HALF_EVEN') AS pending_req_item_qty,
+          --  Cantidad Pendiente
+          CAST(a.pdaexp as NUMERIC) AS decimal_curr_purchased_amt,
+          ROUND(CAST( a.pdaexp as NUMERIC) / NUMERIC '100.0000', 4, 'ROUND_HALF_EVEN') AS curr_purchased_amt,
+          CAST(ROUND(ROUND(cast(a.pdaexp / 100 as NUMERIC), 4, 'ROUND_HALF_EVEN') * i.factor_conversion, 4, 'ROUND_HALF_EVEN') as NUMERIC) AS dlr_purchased_amt,
+          --  Si PDAEXP siempre viene en pesos siempre lo convierto a UDS , saco el case
+          CAST(ROUND(ROUND(cast(a.pdarec / 100 as NUMERIC), 4, 'ROUND_HALF_EVEN') * i.factor_conversion, 4, 'ROUND_HALF_EVEN') as NUMERIC) AS dlr_received_amt,
+          CAST(ROUND(ROUND(cast(a.pdprrc / 10000 as NUMERIC), 4, 'ROUND_HALF_EVEN'), 2, 'ROUND_HALF_EVEN') as NUMERIC) AS local_curr_unit_prc_amt,
+          CAST(ROUND(cast(a.pdprrc * i.factor_conversion as NUMERIC), 2, 'ROUND_HALF_EVEN') as NUMERIC) AS dlr_curr_unit_prc_amt,
+          a.transaction_type
+        FROM
+          -- OC = Orden de Compra (Script Original) /  RE =(Requerimientos)
+          tmp_f4311 AS a
+          LEFT OUTER JOIN tmp_f5943205 AS n ON a.pdkcoo = n.gakcoo
+           AND a.pddoco = n.gadoco
+           AND a.pddcto = n.gadcto
+           AND a.pdlnid = n.galnid
+          LEFT OUTER JOIN p_sourcing.t911f5943206 AS r ON a.pdan8 = r.rpan8
+          INNER JOIN d_dw_tables.company AS cia ON a.pdkcoo = cia.company_cd
+           AND upper(trim(cia.src_env_id)) = 'GE'
+          LEFT OUTER JOIN tmp_f00165 AS b ON a.pdkcoo = b.gdkcoo
+           AND a.pddcto = b.gddcto
+           AND a.pddoco = b.gddoco
+           AND a.pdlnid = b.gdlnid
+          LEFT OUTER JOIN p_manual_tables.purchased_payment_condition AS f ON a.pdptc = f.condition_term_cd
+          LEFT OUTER JOIN tmp_plazo_proveedor AS g ON CAST(g.vendor_party_id as INT64) = CAST(a.pdan8 as INT64)
+           AND cia.country_cd = g.src_env_id
+          LEFT OUTER JOIN (
+            SELECT DISTINCT
+                flt001f4209.hokcoo,
+                flt001f4209.hodcto,
+                flt001f4209.hodoco,
+                max(flt001f4209.hordj) AS hordj
+              FROM
+                p_sourcing.flt001f4209
+              WHERE upper(trim(flt001f4209.hoasts)) = '2A'
+               AND upper(trim(flt001f4209.hodcto)) IN(
+                '6G', '6L', '6Q', '6S'
+              )
+              GROUP BY 1, 2, 3
+          ) AS h ON a.pdokco = h.hokcoo
+           AND a.pdocto = h.hodcto
+           AND a.pdoorn = h.hodoco
+          LEFT OUTER JOIN (
+            SELECT
+                tmp_aprobaciones_cotizaciones.company_cd,
+                tmp_aprobaciones_cotizaciones.orig_requirement_cd,
+                tmp_aprobaciones_cotizaciones.origin_order_type_cd,
+                tmp_aprobaciones_cotizaciones.origin_line_num,
+                min(tmp_aprobaciones_cotizaciones.approval_dt) AS approval_dt
+              FROM
+                tmp_aprobaciones_cotizaciones
+              GROUP BY 1, 2, 3, 4
+          ) AS w ON a.pdokco = w.company_cd
+           AND a.pdocto = w.origin_order_type_cd
+           AND CAST(trim(CAST(a.pdoorn as STRING)) as INT64) = CAST(trim(format('%11d', w.orig_requirement_cd)) as FLOAT64)
+           AND a.pdlnid = w.origin_line_num
+          LEFT OUTER JOIN p_sourcing.t001f5943071 AS k ON k.aban81 = CAST(/* expression of unknown or erroneous type */ a.pdan8 as INT64)
+           AND trim(substr(a.pdlitm, 1, 3)) = trim(concat(trim(abseg1), trim(abseg2)))
+           AND a.pdtrdj BETWEEN k.abtrdj AND k.abaddj
+          LEFT OUTER JOIN tmp_pes_to_usd AS i ON a.pdtrdj_dt = i.date_from
+          LEFT OUTER JOIN p_sourcing.t001f0006 AS l ON trim(a.pdmcu) = trim(l.mcmcu)
+           AND upper(trim(l.idori)) = 'GE'
+          LEFT OUTER JOIN p_sourcing.t001f0006 AS m ON trim(substr(coalesce(trim(a.pdmcu), '-1'), 1, 4)) = trim(m.mcmcu)
+           AND upper(trim(m.idori)) = 'GE'
+        WHERE upper(trim(a.pddcto)) IN(
+          '6A', '6D', 'OS', 'OD', '6B', '6W', '6T', '6U', 'WN', 'WI', '6G', '6L', '6Q'
+        )
+         AND trim(a.pdkcoo) IN(
+          '00058', '00077'
+        )
+         AND upper(trim(a.idori)) = 'FL'
+         AND upper(trim(a.pdptc)) <> ''
+  ;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_work_days_aux
+    AS
+      SELECT
+          count(c.cal_dt) AS days,
+          c.cal_dt
+        FROM
+          d_dw_tables.calendar_date AS c
+          LEFT OUTER JOIN (
+            SELECT
+                holiday.cal_dt
+              FROM
+                p_manual_tables.holiday
+              WHERE upper(trim(holiday.src_env_id)) = 'PE'
+          ) AS f ON f.cal_dt = c.cal_dt
+        WHERE trim(day_of_week_name) NOT IN(
+          'Sabado', 'Domingo'
+        )
+         AND f.cal_dt IS NULL
+        GROUP BY 2
+  ;
+  CREATE TEMPORARY TABLE tmp_work_days
+    CLUSTER BY order_doc_num
+    AS
+      SELECT
+          a.src_env_id,
+          a.order_doc_num,
+          a.order_line_num,
+          a.order_type_cd,
+          a.company_cd,
+          a.approval_dt,
+          a.order_dt,
+          sum(b.days) AS work_days
+        FROM
+          tmp_purchases AS a
+          INNER JOIN tmp_work_days_aux AS b ON b.cal_dt BETWEEN a.approval_dt AND a.order_dt
+        WHERE a.approval_dt IS NOT NULL
+        GROUP BY 1, 2, 3, 4, 5, 6, 7
+        HAVING sum(b.days) IS NOT NULL
+  ;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+  CREATE TEMPORARY TABLE tmp_final
+    CLUSTER BY src_env_id, order_type_cd, order_doc_num, order_line_num
+    AS
+      SELECT
+          coalesce(a.src_env_id, b.src_env_id) AS src_env_id,
+          coalesce(a.company_cd, b.company_cd) AS company_cd,
+          coalesce(a.order_doc_num, -1) AS order_doc_num,
+          coalesce(a.order_type_cd, '-1') AS order_type_cd,
+          coalesce(a.order_suffix, '-1') AS order_suffix,
+          coalesce(CAST(a.order_line_num as INT64), -1) AS order_line_num,
+          a.oper_cost_center_business_cd,
+          a.oper_cost_center_plant_cd,
+          a.oper_cost_center_cd,
+          coalesce(b.inv_cost_center_business_cd, '-1') AS inv_cost_center_business_cd,
+          coalesce(b.inv_cost_center_plant_cd, '-1') AS inv_cost_center_plant_cd,
+          coalesce(b.inv_cost_center_cd, '-1') AS inv_cost_center_cd,
+          a.uom_cd,
+          a.order_next_status,
+          a.order_last_status,
+          a.origin_order_type_cd,
+          a.origin_order_line_num,
+          a.orig_requirement_cd,
+          a.purch_item_cd,
+          a.days_delay,
+          c.work_days,
+          coalesce(a.vendor_party_id, b.vendor_party_id) AS vendor_party_id,
+          coalesce(a.order_originator_id, '-1') AS order_originator_id,
+          coalesce(trim(format('%11d', cast(a.order_negotiator_id as INT64))), format('%11d', -1)) AS order_negotiator_id,
+          coalesce(trim(a.management_id), 'Valor No Informado') AS management_id,
+          a.term_dt,
+          a.req_negotiator_id,
+          CASE
+            WHEN trim(a.category_cd) = '' THEN '-1'
+            ELSE coalesce(a.category_cd, '-1')
+          END AS category_cd,
+          CASE
+            WHEN trim(a.subcategory_cd) = '' THEN '-1'
+            ELSE coalesce(a.subcategory_cd, '-1')
+          END AS subcategory_cd,
+          a.order_currency_cd,
+          b.ap_txn_type_cd,
+          b.vendor_issuing_center_cd,
+          b.vendor_invoice_cd,
+          b.vendor_invoice_line_cd,
+          b.vendor_desc,
+          b.vendor_tax_identifier_id,
+          b.fiscal_condition_id,
+          b.vendor_invoice_dt,
+          b.vendor_invoice_month,
+          cast(trunc(b.vendor_invoice_month / 100) as INT64) AS vendor_invoice_year,
+          a.approval_dt,
+          a.approval_month,
+          cast(trunc(a.approval_month / 100) as INT64) AS approval_year,
+          a.order_dt,
+          a.order_month,
+          cast(trunc(a.order_month / 100) as INT64) AS order_year,
+          coalesce(trim(format('%4d', a.corporate_item_id)), '-1') AS corporate_item_id,
+          coalesce(trim(format('%4d', a.item_term_cd)), '-1') AS item_term_cd,
+          a.transaction_type,
+          -- OC = Orden de Compra (Script Original) /  RE =(Requerimientos)
+          b.invoice_amt,
+          a.order_term_num,
+          b.order_payment_term,
+          coalesce(a.vendor_pmt_term_num, b.vendor_pmt_term_num) AS vendor_pmt_term_num,
+          a.received_amt,
+          a.purchased_qty,
+          a.purch_req_item_qty,
+          a.pending_req_item_qty,
+          a.curr_purchased_amt,
+          a.dlr_purchased_amt,
+          a.dlr_received_amt,
+          a.local_curr_unit_prc_amt,
+          a.dlr_curr_unit_prc_amt,
+          a.purch_order_detail_txt
+        FROM
+          tmp_purchases AS a
+          LEFT OUTER JOIN tmp_work_days AS c ON a.src_env_id = c.src_env_id
+           AND a.company_cd = c.company_cd
+           AND a.order_type_cd = c.order_type_cd
+           AND a.order_doc_num = c.order_doc_num
+           AND a.order_line_num = c.order_line_num
+          FULL OUTER JOIN tmp_payments AS b ON upper(trim(a.src_env_id)) = upper(trim(b.src_env_id))
+           AND a.company_cd = b.company_cd
+           AND a.order_doc_num = b.order_doc_num
+           AND a.order_type_cd = b.order_type_cd
+           AND a.order_line_num = b.order_line_num
+  ;
+COMMIT TRANSACTION;
+EXCEPTION WHEN ERROR THEN
+ROLLBACK TRANSACTION;
+RAISE;
+END;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+--  Delete en el Warehouse
+-- *********************************************************************************************************************************************************************--
+BEGIN
+BEGIN TRANSACTION;
+  DELETE FROM d_dw_tables.purchase_transaction WHERE (trim(purchase_transaction.src_env_id), purchase_transaction.company_cd, trim(purchase_transaction.order_type_cd), purchase_transaction.order_doc_num, purchase_transaction.order_line_num) IN(
+    SELECT AS STRUCT
+        trim(tmp_final.src_env_id) AS src_env_id,
+        tmp_final.company_cd,
+        trim(tmp_final.order_type_cd) AS order_type_cd,
+        tmp_final.order_doc_num,
+        tmp_final.order_line_num
+      FROM
+        tmp_final
+  );
+-- *********************************************************************************************************************************************************************--
+--  Insert en el Warehouse
+-- *********************************************************************************************************************************************************************--
+  INSERT INTO d_dw_tables.purchase_transaction (src_env_id, company_cd, order_type_cd, order_suffix, order_doc_num, order_line_num, order_next_status, order_last_status, oper_cost_center_business_cd, oper_cost_center_plant_cd, oper_cost_center_cd, inv_cost_center_business_cd, inv_cost_center_plant_cd, inv_cost_center_cd, uom_cd, origin_order_type_cd, origin_order_line_num, orig_requirement_cd, purch_item_cd, days_delay, vendor_party_id, order_originator_id, order_negotiator_id, management_id, term_dt, req_negotiator_id, category_cd, subcategory_cd, order_currency_cd, ap_txn_type_cd, vendor_issuing_center_cd, vendor_invoice_cd, vendor_invoice_line_cd, vendor_desc, vendor_tax_identifier_id, fiscal_condition_id, vendor_invoice_dt, vendor_invoice_month, vendor_invoice_year, approval_dt, approval_month, approval_year, order_dt, order_month, order_year, corporate_item_id, item_term_cd, transaction_type, invoice_amt, order_term_num, order_payment_term, vendor_pmt_term_num, received_amt, purchased_qty, purch_req_item_qty, pending_req_item_qty, curr_purchased_amt, dlr_purchased_amt, dlr_received_amt, local_curr_unit_prc_amt, dlr_curr_unit_prc_amt, purch_order_detail_txt, load_id)
+    SELECT
+        tmp_final.src_env_id,
+        tmp_final.company_cd,
+        tmp_final.order_type_cd,
+        tmp_final.order_suffix,
+        tmp_final.order_doc_num,
+        tmp_final.order_line_num,
+        tmp_final.order_next_status,
+        tmp_final.order_last_status,
+        tmp_final.oper_cost_center_business_cd,
+        tmp_final.oper_cost_center_plant_cd,
+        tmp_final.oper_cost_center_cd,
+        tmp_final.inv_cost_center_business_cd,
+        tmp_final.inv_cost_center_plant_cd,
+        tmp_final.inv_cost_center_cd,
+        tmp_final.uom_cd,
+        tmp_final.origin_order_type_cd,
+        tmp_final.origin_order_line_num,
+        tmp_final.orig_requirement_cd,
+        tmp_final.purch_item_cd,
+        tmp_final.work_days,
+        tmp_final.vendor_party_id,
+        tmp_final.order_originator_id,
+        tmp_final.order_negotiator_id,
+        tmp_final.management_id,
+        tmp_final.term_dt,
+        tmp_final.req_negotiator_id,
+        tmp_final.category_cd,
+        tmp_final.subcategory_cd,
+        tmp_final.order_currency_cd,
+        tmp_final.ap_txn_type_cd,
+        tmp_final.vendor_issuing_center_cd,
+        tmp_final.vendor_invoice_cd,
+        tmp_final.vendor_invoice_line_cd,
+        tmp_final.vendor_desc,
+        tmp_final.vendor_tax_identifier_id,
+        tmp_final.fiscal_condition_id,
+        tmp_final.vendor_invoice_dt,
+        tmp_final.vendor_invoice_month,
+        tmp_final.vendor_invoice_year,
+        tmp_final.approval_dt,
+        tmp_final.approval_month,
+        tmp_final.approval_year,
+        tmp_final.order_dt,
+        tmp_final.order_month,
+        tmp_final.order_year,
+        tmp_final.corporate_item_id,
+        tmp_final.item_term_cd,
+        tmp_final.transaction_type,
+        tmp_final.invoice_amt,
+        tmp_final.order_term_num,
+        tmp_final.order_payment_term,
+        tmp_final.vendor_pmt_term_num,
+        tmp_final.received_amt,
+        tmp_final.purchased_qty,
+        tmp_final.purch_req_item_qty,
+        tmp_final.pending_req_item_qty,
+        tmp_final.curr_purchased_amt,
+        tmp_final.dlr_purchased_amt,
+        tmp_final.dlr_received_amt,
+        tmp_final.local_curr_unit_prc_amt,
+        tmp_final.dlr_curr_unit_prc_amt,
+        tmp_final.purch_order_detail_txt,
+        v_load_id
+      FROM
+        tmp_final
+      WHERE (tmp_final.order_last_status <> 980
+       OR tmp_final.order_last_status = 980
+       AND tmp_final.received_amt <> 0)
+       AND tmp_final.order_next_status >= 380
+       AND upper(trim(tmp_final.transaction_type)) = 'OC'
+       OR upper(trim(tmp_final.transaction_type)) = 'RE'
+  ;
+COMMIT TRANSACTION;
+EXCEPTION WHEN ERROR THEN
+ROLLBACK TRANSACTION;
+RAISE;
+END;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+BEGIN
+BEGIN TRANSACTION;
+  DROP TABLE tmp_param;
+  DROP TABLE tmp_f4209_1;
+  DROP TABLE tmp_f4209_2;
+  DROP TABLE tmp_f4311_oc;
+  DROP TABLE tmp_f4311_req;
+  DROP TABLE tmp_f4311;
+  DROP TABLE tmp_pes_to_usd;
+  DROP TABLE tmp_plazo_proveedor;
+  DROP TABLE tmp_payord;
+  DROP TABLE tmp_payord_2;
+  DROP TABLE tmp_payments;
+  DROP TABLE tmp_aprobaciones_cotizaciones;
+  DROP TABLE tmp_f00165;
+  DROP TABLE tmp_f5943205;
+  DROP TABLE tmp_purchases;
+  DROP TABLE tmp_work_days_aux;
+  DROP TABLE tmp_work_days;
+  DROP TABLE tmp_final;
+-- *********************************************************************************************************************************************************************--
+-- *********************************************************************************************************************************************************************--
+COMMIT TRANSACTION;
+EXCEPTION WHEN ERROR THEN
+ROLLBACK TRANSACTION;
+RAISE;
+END;
